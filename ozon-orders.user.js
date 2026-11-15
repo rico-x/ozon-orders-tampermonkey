@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ozon — сортировка заказов
 // @namespace    ozon-orders-local
-// @version      1.2.0
+// @version      1.3.0
 // @description  Сортирует заказы по дате оформления или доставки и скрывает полученные.
 // @author       Rico-X
 // @copyright    2026 Rico-X
@@ -46,6 +46,7 @@
     let positionedCards = new Set();
     let watchedCards = new Set();
     let hiddenCards = new Set();
+    let preload = null;
     let renderQueued = false;
 
     GM_addStyle(`
@@ -88,6 +89,15 @@
             position: relative !important; top: var(--tm-ozon-offset) !important;
             overflow-anchor: none;
         }
+        [data-tm-ozon-pager] {
+            position: fixed !important;
+            inset: 2px auto auto 2px !important;
+            width: 1px !important;
+            height: 1px !important;
+            overflow: hidden !important;
+            pointer-events: none;
+        }
+        [data-tm-ozon-pager="offscreen"] { top: -20px !important; }
     `);
 
     const panel = document.createElement('details');
@@ -167,7 +177,7 @@
         const iso = label.match(/^(20\d{2})-(\d{2})-(\d{2})(?=$|[t ,.!])/);
         if (iso) return calendarDay(Number(iso[1]), Number(iso[2]), Number(iso[3]));
 
-        const [startText, endText] = label.split(/\s*[-–—−]\s*/, 2);
+        const [startText, endText] = label.split(/\s*[-–—−]\s*| по /, 2);
         const start = readDatePart(startText);
         const end = endText && readDatePart(endText);
         if (!start || (!start.month && !end?.month)) return null;
@@ -188,6 +198,36 @@
         return calendarDay(startYear, startMonth, start.day);
     }
 
+    function readDeliveryEstimate(text, today) {
+        const time = text.match(/[ ,]+(?:с )?([01]?\d|2[0-3]):([0-5]\d)(?!\d)/);
+        const label = time ? text.slice(0, time.index) : text;
+        const start = parseDate(label, today, true);
+        if (start === null) return null;
+
+        const endLabel = label.replace(/^20\d{2}-\d{2}-\d{2}/, '').match(/(?:[-–—−]| по )\s*(.+)$/)?.[1];
+        let end = null;
+        if (endLabel) {
+            const part = readDatePart(endLabel);
+            if (part) {
+                const firstDay = new Date(start);
+                const firstMonth = firstDay.getUTCMonth() + 1;
+                const month = part.month || firstMonth;
+                const year = part.year || firstDay.getUTCFullYear() + Number(month < firstMonth);
+                end = calendarDay(year, month, part.day);
+            } else {
+                end = parseDate(endLabel, today, true);
+            }
+        }
+
+        const currentDay = Date.UTC(today.getFullYear(), today.getMonth(), today.getDate());
+        if ((end ?? start) < currentDay) return null;
+        return {
+            day: Math.max(start, currentDay),
+            range: end !== null && end > start,
+            minutes: time ? 60 * Number(time[1]) + Number(time[2]) : null,
+        };
+    }
+
     function readCard(element, today) {
         // Ozon places the order-details link before the status and delivery block.
         const link = Array.from(element.children).find(child => child.matches('a[href*="/my/orderdetails"]'));
@@ -200,15 +240,19 @@
         const labels = Array.from(header?.children ?? [], node => normalize(node.textContent));
         const status = labels[0] ?? '';
         const delivered = deliveredStatus.test(status) && !waitingForPickup.test(status);
-        let deliveryDate = delivered ? parseDate(status.replace(deliveredStatus, ''), today) : null;
+        const receivedDay = delivered ? parseDate(status.replace(deliveredStatus, ''), today) : null;
+        let delivery = receivedDay === null ? null : { day: receivedDay, range: false, minutes: null };
         if (!delivered) {
             for (const label of labels) {
-                const estimate = label.match(/^(?:ожидаем|доставим|доставка)[ ,:]+(.+)/);
-                if (estimate) deliveryDate = parseDate(estimate[1], today, true);
-                if (deliveryDate !== null) break;
+                const estimate = label.match(/^(?:ожидаем|доставим|доставят|доставка)[ ,:]+(.+)/);
+                if (estimate) delivery = readDeliveryEstimate(estimate[1], today);
+                else if (/^(?:сегодня|завтра|послезавтра)(?=$|[ ,.!])/.test(label)) {
+                    delivery = readDeliveryEstimate(label, today);
+                }
+                if (delivery) break;
             }
         }
-        return { element, url: url.href, delivered, deliveryDate };
+        return { element, url: url.href, delivered, delivery };
     }
 
     async function loadOrderDates() {
@@ -280,12 +324,48 @@
         return cards.filter(card => !hiddenCards.has(card.element));
     }
 
+    function stopPreloading() {
+        if (!preload) return;
+        clearTimeout(preload.pulse);
+        clearTimeout(preload.timeout);
+        preload.marker.removeAttribute('data-tm-ozon-pager');
+        preload = null;
+    }
+
+    function preloadActiveOrders(paginator, firstList, count) {
+        const tab = new URLSearchParams(location.search).get('selectedTab');
+        const content = paginator && Array.from(paginator.children).find(child => child.contains(firstList));
+        const marker = (!tab || tab === 'active') ? content?.nextElementSibling : null;
+        if (!count || !marker?.firstElementChild || marker.nextElementSibling) {
+            stopPreloading();
+            return false;
+        }
+        if (preload?.marker === marker && preload.count === count) return preload.waiting;
+
+        stopPreloading();
+        const request = { marker, count, waiting: true };
+        preload = request;
+        // Trigger Ozon's existing scroll observer without moving the viewport or its DOM nodes.
+        marker.setAttribute('data-tm-ozon-pager', 'offscreen');
+        request.pulse = setTimeout(() => {
+            marker.setAttribute('data-tm-ozon-pager', 'visible');
+            request.timeout = setTimeout(() => {
+                marker.removeAttribute('data-tm-ozon-pager');
+                request.waiting = false;
+                scheduleRender();
+            }, 6500);
+        }, 100);
+        return true;
+    }
+
     function positionCards(cards, sort, byOrder) {
         // Offset the existing cards and keep the layout boxes Ozon uses for pagination.
         const natural = cards.map(card => ({
             element: card.element,
             rect: card.element.getBoundingClientRect(),
-            date: (byOrder ? orderDates.get(card.url) : card.deliveryDate) ?? null,
+            date: (byOrder ? orderDates.get(card.url) : card.delivery?.day) ?? null,
+            range: !byOrder && card.delivery?.range === true,
+            minutes: byOrder ? null : card.delivery?.minutes ?? null,
         })).filter(card => card.rect.height > 0 && card.rect.width > 0);
         if (natural.length < 2) return true;
 
@@ -298,7 +378,12 @@
         const sorted = [...natural].sort((left, right) => {
             if (left.date === null) return Number(right.date !== null);
             if (right.date === null) return -1;
-            return direction * (left.date - right.date);
+            const byDate = direction * (left.date - right.date);
+            if (byDate || byOrder) return byDate;
+            if (left.range !== right.range) return Number(left.range) - Number(right.range);
+            if (left.minutes === null) return Number(right.minutes !== null);
+            if (right.minutes === null) return -1;
+            return direction * (left.minutes - right.minutes);
         });
 
         let top = first.top;
@@ -322,6 +407,7 @@
         if (!firstList && !tabs) {
             panel.remove();
             pendingOrders = [];
+            stopPreloading();
             applyFilter([]);
             watchCardSizes([]);
             return;
@@ -334,22 +420,30 @@
 
         const today = new Date();
         const cards = lists.flatMap(list => Array.from(list.children, element => readCard(element, today))).filter(Boolean);
-        const visibleCards = applyFilter(cards);
+        const preloading = preloadActiveOrders(paginator, firstList, cards.length);
+        const visibleCards = preloading ? cards : applyFilter(cards);
         const sort = sortControl.value;
         const byOrder = sort.startsWith('order-');
-        watchCardSizes(sort === 'default' ? [] : visibleCards);
-        const canSort = sort === 'default' || positionCards(visibleCards, sort, byOrder);
-        pendingOrders = byOrder && canSort ? [...new Set(visibleCards.map(card => card.url))].filter(url => !orderDates.has(url)) : [];
+        const orderURLs = byOrder && !preloading ? [...new Set(visibleCards.map(card => card.url))] : [];
+        pendingOrders = orderURLs.filter(url => !orderDates.has(url));
+        const loadingOrderDates = pendingOrders.length > 0 && !requestsPaused;
+        const waitToSort = preloading || loadingOrderDates;
+        watchCardSizes(waitToSort || sort === 'default' ? [] : visibleCards);
+        const canSort = waitToSort || sort === 'default' || positionCards(visibleCards, sort, byOrder);
 
         const status = [];
         const hidden = cards.length - visibleCards.length;
         if (!cards.length) status.push('На странице пока нет доступных карточек заказов.');
         if (hidden) status.push(visibleCards.length ? `Скрыто доставленных: ${hidden}.` : 'Все загруженные заказы скрыты фильтром.');
         if (!canSort) status.push('Сортировка недоступна для этого вида ленты.');
-        if (canSort && visibleCards.length && sort.startsWith('delivery-')) status.push('Для интервала доставки используется первый день.');
+        if (preloading) status.push(`Подгружаются актуальные заказы… Загружено ${cards.length}.`);
+        else if (preload) status.push('Ozon пока не загрузил следующую порцию актуальных заказов.');
+        if (!preloading && canSort && visibleCards.length && sort.startsWith('delivery-')) {
+            status.push('Для действующего интервала берётся ближайший день.');
+        }
         const missingDates = byOrder && (visibleCards.some(card => orderDates.get(card.url) === null)
             || (requestsPaused && pendingOrders.length > 0));
-        if (byOrder && pendingOrders.length && !requestsPaused) status.push('Загружаются даты оформления…');
+        if (loadingOrderDates) status.push(`Загружаются даты оформления… ${orderURLs.length - pendingOrders.length} из ${orderURLs.length}.`);
         if (missingDates) {
             status.push('Часть дат оформления недоступна. Эти заказы в конце списка.');
         }
