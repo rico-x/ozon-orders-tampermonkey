@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Ozon — сортировка заказов
 // @namespace    ozon-orders-local
-// @version      1.3.0
-// @description  Сортирует заказы по дате оформления или доставки и скрывает полученные.
+// @version      1.4.0
+// @description  Сортирует заказы по дате оформления или доставки и скрывает доставленные и отменённые.
 // @author       Rico-X
 // @copyright    2026 Rico-X
 // @license      MIT
@@ -38,6 +38,7 @@
     const datePart = new RegExp(`^(\\d{1,2})(?: (${months.join('|')}))?(?: (20\\d{2}))?(?=$|[ ,.!])`, 'i');
     const deliveredStatus = /^(?:получен[аоы]?|доставлен[аоы]?)(?=$|[ ,.!])/i;
     const waitingForPickup = /^доставлен[аоы]? (?:в (?:пункт|постамат)|на пункт)(?=$| )/i;
+    const cancelledStatus = /^(?:заказ )?отмен[её]н[аоы]?(?=$|[ ,.!:])/;
     const orderDates = new Map();
     let pendingOrders = [];
     let loadingDates = false;
@@ -102,19 +103,20 @@
 
     const panel = document.createElement('details');
     panel.id = 'tm-ozon-orders';
-    panel.open = true;
     panel.innerHTML = `
         <summary>Сортировка заказов</summary>
         <div class="tm-ozon-controls">
             <label>Порядок <select></select></label>
-            <label><input type="checkbox"> Скрыть доставленные</label>
+            <label><input type="checkbox" name="hide-delivered"> Скрыть доставленные</label>
+            <label><input type="checkbox" name="hide-cancelled"> Скрыть отменённые</label>
             <button type="button" data-reset hidden>Сбросить</button>
             <button type="button" data-retry hidden>Повторить загрузку дат</button>
             <p role="status" hidden></p>
         </div>
     `;
     const sortControl = panel.querySelector('select');
-    const hideControl = panel.querySelector('input');
+    const hideDeliveredControl = panel.querySelector('[name="hide-delivered"]');
+    const hideCancelledControl = panel.querySelector('[name="hide-cancelled"]');
     const resetControl = panel.querySelector('[data-reset]');
     const retryControl = panel.querySelector('[data-retry]');
     const statusLine = panel.querySelector('p');
@@ -122,19 +124,23 @@
     // Start with native layout and all cards visible when upgrading from 1.0.
     const savedSort = GM_getValue('orderSort', 'default');
     sortControl.value = sortModes.has(savedSort) ? savedSort : 'default';
-    hideControl.checked = GM_getValue('filterDelivered', false) === true;
+    hideDeliveredControl.checked = GM_getValue('filterDelivered', false) === true;
+    hideCancelledControl.checked = GM_getValue('filterCancelled', false) === true;
 
     function saveFilters() {
         GM_setValue('orderSort', sortControl.value);
-        GM_setValue('filterDelivered', hideControl.checked);
+        GM_setValue('filterDelivered', hideDeliveredControl.checked);
+        GM_setValue('filterCancelled', hideCancelledControl.checked);
         render();
     }
 
     sortControl.addEventListener('change', saveFilters);
-    hideControl.addEventListener('change', saveFilters);
+    hideDeliveredControl.addEventListener('change', saveFilters);
+    hideCancelledControl.addEventListener('change', saveFilters);
     resetControl.addEventListener('click', () => {
         sortControl.value = 'default';
-        hideControl.checked = false;
+        hideDeliveredControl.checked = false;
+        hideCancelledControl.checked = false;
         saveFilters();
     });
     retryControl.addEventListener('click', () => {
@@ -240,6 +246,7 @@
         const labels = Array.from(header?.children ?? [], node => normalize(node.textContent));
         const status = labels[0] ?? '';
         const delivered = deliveredStatus.test(status) && !waitingForPickup.test(status);
+        const cancelled = cancelledStatus.test(status);
         const receivedDay = delivered ? parseDate(status.replace(deliveredStatus, ''), today) : null;
         let delivery = receivedDay === null ? null : { day: receivedDay, range: false, minutes: null };
         if (!delivered) {
@@ -252,7 +259,7 @@
                 if (delivery) break;
             }
         }
-        return { element, url: url.href, delivered, delivery };
+        return { element, url: url.href, delivered, cancelled, delivery };
     }
 
     async function loadOrderDates() {
@@ -315,7 +322,10 @@
     }
 
     function applyFilter(cards) {
-        const next = hideControl.checked ? new Set(cards.filter(card => card.delivered).map(card => card.element)) : new Set();
+        const next = new Set(cards.filter(card =>
+            (hideDeliveredControl.checked && card.delivered)
+            || (hideCancelledControl.checked && card.cancelled),
+        ).map(card => card.element));
         for (const element of hiddenCards) {
             if (!next.has(element)) element.removeAttribute('data-tm-ozon-hidden');
         }
@@ -416,7 +426,10 @@
         const paginator = firstList?.closest('[data-widget="paginator"]');
         const lists = paginator ? [...paginator.querySelectorAll(listSelector)] : (firstList ? [firstList] : []);
         // Inserting siblings into Ozon's root while Vue hydrates can abort the whole order list.
-        if (!panel.isConnected) document.body.append(panel);
+        if (!panel.isConnected) {
+            panel.open = false;
+            document.body.append(panel);
+        }
 
         const today = new Date();
         const cards = lists.flatMap(list => Array.from(list.children, element => readCard(element, today))).filter(Boolean);
@@ -434,7 +447,7 @@
         const status = [];
         const hidden = cards.length - visibleCards.length;
         if (!cards.length) status.push('На странице пока нет доступных карточек заказов.');
-        if (hidden) status.push(visibleCards.length ? `Скрыто доставленных: ${hidden}.` : 'Все загруженные заказы скрыты фильтром.');
+        if (hidden) status.push(visibleCards.length ? `Скрыто заказов: ${hidden}.` : 'Все загруженные заказы скрыты фильтрами.');
         if (!canSort) status.push('Сортировка недоступна для этого вида ленты.');
         if (preloading) status.push(`Подгружаются актуальные заказы… Загружено ${cards.length}.`);
         else if (preload) status.push('Ozon пока не загрузил следующую порцию актуальных заказов.');
@@ -447,7 +460,7 @@
         if (missingDates) {
             status.push('Часть дат оформления недоступна. Эти заказы в конце списка.');
         }
-        resetControl.hidden = sort === 'default' && !hideControl.checked;
+        resetControl.hidden = sort === 'default' && !hideDeliveredControl.checked && !hideCancelledControl.checked;
         retryControl.hidden = !missingDates;
         statusLine.hidden = status.length === 0;
         const message = status.join(' ');
