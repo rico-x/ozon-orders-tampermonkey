@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Ozon — сортировка заказов
 // @namespace    ozon-orders-local
-// @version      1.4.0
-// @description  Сортирует заказы по дате оформления или доставки и скрывает доставленные и отменённые.
+// @version      1.5.0
+// @description  Поиск по заказам Ozon, сортировка и фильтры для актуальных заказов.
 // @author       Rico-X
 // @copyright    2026 Rico-X
 // @license      MIT
@@ -39,9 +39,12 @@
     const deliveredStatus = /^(?:получен[аоы]?|доставлен[аоы]?)(?=$|[ ,.!])/i;
     const waitingForPickup = /^доставлен[аоы]? (?:в (?:пункт|постамат)|на пункт)(?=$| )/i;
     const cancelledStatus = /^(?:заказ )?отмен[её]н[аоы]?(?=$|[ ,.!:])/;
-    const orderDates = new Map();
+    const orderDetails = new Map();
+    const searches = { active: '', archive: '' };
+    let displayedTab = null;
     let pendingOrders = [];
-    let loadingDates = false;
+    let retryOrders = [];
+    let loadingDetails = false;
     let requestsPaused = false;
     let unreadableDetails = 0;
     let positionedCards = new Set();
@@ -69,7 +72,7 @@
             line-height: 1.4;
         }
         #tm-ozon-orders summary { cursor: pointer; }
-        #tm-ozon-orders .tm-ozon-controls {
+        #tm-ozon-orders .tm-ozon-controls, #tm-ozon-orders form {
             display: flex;
             flex-wrap: wrap;
             gap: 12px 20px;
@@ -77,11 +80,14 @@
             max-width: 400px;
             margin-top: 10px;
         }
+        #tm-ozon-orders form { gap: 6px; }
+        #tm-ozon-orders form label { flex-basis: 100%; }
         #tm-ozon-orders label { display: inline-flex; align-items: center; gap: 8px; max-width: 100%; }
-        #tm-ozon-orders select, #tm-ozon-orders button {
+        #tm-ozon-orders select, #tm-ozon-orders button, #tm-ozon-orders input[type="search"] {
             max-width: 100%; padding: 6px 8px; border: 1px solid #b9c4d3;
             border-radius: 8px; background: white; color: inherit; font: inherit;
         }
+        #tm-ozon-orders input[type="search"] { flex: 1 1 210px; min-width: 0; }
         #tm-ozon-orders select { min-width: 0; }
         #tm-ozon-orders input { margin: 0; accent-color: #005bff; }
         #tm-ozon-orders p { flex-basis: 100%; margin: 0; color: #41556b; font-size: 13px; }
@@ -104,21 +110,35 @@
     const panel = document.createElement('details');
     panel.id = 'tm-ozon-orders';
     panel.innerHTML = `
-        <summary>Сортировка заказов</summary>
-        <div class="tm-ozon-controls">
+        <summary>Сортировка и поиск</summary>
+        <form role="search" aria-label="Поиск по заказам Ozon">
+            <label for="tm-ozon-search">Поиск по заказам</label>
+            <input id="tm-ozon-search" type="search" placeholder="Товар, номер или статус" autocomplete="off">
+            <button type="submit">Найти</button>
+            <button type="button" data-clear hidden>Очистить</button>
+        </form>
+        <div class="tm-ozon-controls" data-active-controls>
             <label>Порядок <select></select></label>
             <label><input type="checkbox" name="hide-delivered"> Скрыть доставленные</label>
             <label><input type="checkbox" name="hide-cancelled"> Скрыть отменённые</label>
             <button type="button" data-reset hidden>Сбросить</button>
-            <button type="button" data-retry hidden>Повторить загрузку дат</button>
-            <p role="status" hidden></p>
+        </div>
+        <div class="tm-ozon-controls" data-feedback hidden>
+            <p role="status"></p>
+            <button type="button" data-retry hidden>Повторить загрузку деталей</button>
         </div>
     `;
+    const panelTitle = panel.querySelector('summary');
+    const searchForm = panel.querySelector('form');
+    const searchInput = searchForm.querySelector('input');
+    const clearSearch = searchForm.querySelector('[data-clear]');
+    const activeControls = panel.querySelector('[data-active-controls]');
     const sortControl = panel.querySelector('select');
     const hideDeliveredControl = panel.querySelector('[name="hide-delivered"]');
     const hideCancelledControl = panel.querySelector('[name="hide-cancelled"]');
     const resetControl = panel.querySelector('[data-reset]');
     const retryControl = panel.querySelector('[data-retry]');
+    const feedback = panel.querySelector('[data-feedback]');
     const statusLine = panel.querySelector('p');
     for (const [value, label] of sortModes) sortControl.add(new Option(label, value));
     // Start with native layout and all cards visible when upgrading from 1.0.
@@ -126,6 +146,30 @@
     sortControl.value = sortModes.has(savedSort) ? savedSort : 'default';
     hideDeliveredControl.checked = GM_getValue('filterDelivered', false) === true;
     hideCancelledControl.checked = GM_getValue('filterCancelled', false) === true;
+
+    function currentTab() {
+        const tab = new URLSearchParams(location.search).get('selectedTab');
+        return !tab || tab === 'active' ? 'active' : 'archive';
+    }
+
+    searchForm.addEventListener('submit', event => {
+        event.preventDefault();
+        searches[currentTab()] = searchInput.value.trim();
+        render();
+    });
+    clearSearch.addEventListener('click', () => {
+        searchInput.value = '';
+        searches[currentTab()] = '';
+        render();
+        searchInput.focus();
+    });
+    searchInput.addEventListener('input', () => {
+        clearSearch.hidden = !searchInput.value && !searches[currentTab()];
+        if (!searchInput.value && searches[currentTab()]) {
+            searches[currentTab()] = '';
+            render();
+        }
+    });
 
     function saveFilters() {
         GM_setValue('orderSort', sortControl.value);
@@ -144,16 +188,19 @@
         saveFilters();
     });
     retryControl.addEventListener('click', () => {
-        for (const [url, date] of orderDates) {
-            if (date === null) orderDates.delete(url);
-        }
+        for (const key of retryOrders) orderDetails.delete(key);
         unreadableDetails = 0;
         requestsPaused = false;
+        stopPreloading();
         render();
     });
 
     function normalize(text) {
         return (text ?? '').replace(/\s+/g, ' ').trim().toLowerCase();
+    }
+
+    function normalizeSearch(text) {
+        return normalize(text).replace(/ё/g, 'е').replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
     }
 
     function calendarDay(year, month, day) {
@@ -259,16 +306,40 @@
                 if (delivery) break;
             }
         }
-        return { element, url: url.href, delivered, cancelled, delivery };
+        const number = url.searchParams.get('order') ?? '';
+        return {
+            element, url: url.href, key: number || url.href, number, delivered, cancelled, delivery,
+            searchText: normalizeSearch(`${number} ${status}`),
+        };
     }
 
-    async function loadOrderDates() {
-        if (loadingDates || requestsPaused || pendingOrders.length === 0) return;
-        loadingDates = true;
+    function readOrderDetails(html) {
+        const details = document.createElement('template');
+        details.innerHTML = html;
+        const content = details.content;
+        const headings = content.querySelectorAll('[data-widget="titleWithTimer"] span, [data-widget="titleWithTimer"], h1, h2');
+        let date = null;
+        for (const heading of headings) {
+            const match = normalize(heading.textContent).match(/^заказ от (.+)/);
+            if (!match) continue;
+            date = parseDate(match[1], new Date());
+            if (date !== null) break;
+        }
+
+        const items = content.querySelectorAll(
+            '[data-widget="shipmentWidget"] .tsCompact500Medium, [data-widget="orderDetailsContainer"] a[href*="/product/"]',
+        );
+        const products = normalizeSearch(Array.from(items, item => item.textContent).join(' ')) || null;
+        return { date, products };
+    }
+
+    async function loadOrderDetails() {
+        if (loadingDetails || requestsPaused || pendingOrders.length === 0) return;
+        loadingDetails = true;
         while (!requestsPaused && pendingOrders.length && /^\/my\/orderlist\/?$/.test(location.pathname)) {
-            const url = pendingOrders.shift();
-            if (orderDates.has(url)) continue;
-            let date = null;
+            const { key, url } = pendingOrders.shift();
+            if (orderDetails.has(key)) continue;
+            let details = null;
             try {
                 const response = await fetch(url, {
                     credentials: 'same-origin',
@@ -277,27 +348,17 @@
                     signal: AbortSignal.timeout(12000),
                 });
                 requestsPaused = [401, 403, 429].includes(response.status);
-                if (response.ok) {
-                    const details = document.createElement('template');
-                    details.innerHTML = await response.text();
-                    const headings = details.content.querySelectorAll('[data-widget="titleWithTimer"] span, [data-widget="titleWithTimer"], h1, h2');
-                    for (const heading of headings) {
-                        const match = normalize(heading.textContent).match(/^заказ от (.+)/);
-                        if (!match) continue;
-                        date = parseDate(match[1], new Date());
-                        if (date !== null) break;
-                    }
-                }
+                if (response.ok) details = readOrderDetails(await response.text());
             } catch {
-                // Keep the card visible when its detail page cannot be read.
+                // Leave a failed entry in the cache until the user retries.
             }
-            orderDates.set(url, date);
-            unreadableDetails = date === null ? unreadableDetails + 1 : 0;
+            orderDetails.set(key, details);
+            unreadableDetails = details?.date != null || details?.products ? 0 : unreadableDetails + 1;
             if (unreadableDetails >= 3) requestsPaused = true;
             scheduleRender();
             await new Promise(resolve => setTimeout(resolve, 600));
         }
-        loadingDates = false;
+        loadingDetails = false;
     }
 
     function clearPositions() {
@@ -321,17 +382,16 @@
         watchedCards = next;
     }
 
-    function applyFilter(cards) {
-        const next = new Set(cards.filter(card =>
-            (hideDeliveredControl.checked && card.delivered)
-            || (hideCancelledControl.checked && card.cancelled),
-        ).map(card => card.element));
+    function applyVisibility(cards, visibleCards) {
+        const visible = new Set(visibleCards);
+        const next = new Set(cards.filter(card => !visible.has(card)).map(card => card.element));
         for (const element of hiddenCards) {
             if (!next.has(element)) element.removeAttribute('data-tm-ozon-hidden');
         }
-        for (const element of next) element.setAttribute('data-tm-ozon-hidden', '');
+        for (const element of next) {
+            if (!hiddenCards.has(element)) element.setAttribute('data-tm-ozon-hidden', '');
+        }
         hiddenCards = next;
-        return cards.filter(card => !hiddenCards.has(card.element));
     }
 
     function stopPreloading() {
@@ -342,10 +402,9 @@
         preload = null;
     }
 
-    function preloadActiveOrders(paginator, firstList, count) {
-        const tab = new URLSearchParams(location.search).get('selectedTab');
-        const content = paginator && Array.from(paginator.children).find(child => child.contains(firstList));
-        const marker = (!tab || tab === 'active') ? content?.nextElementSibling : null;
+    function preloadOrders(paginator, firstList, count, enabled) {
+        const content = enabled && paginator && Array.from(paginator.children).find(child => child.contains(firstList));
+        const marker = content?.nextElementSibling;
         if (!count || !marker?.firstElementChild || marker.nextElementSibling) {
             stopPreloading();
             return false;
@@ -373,7 +432,7 @@
         const natural = cards.map(card => ({
             element: card.element,
             rect: card.element.getBoundingClientRect(),
-            date: (byOrder ? orderDates.get(card.url) : card.delivery?.day) ?? null,
+            date: (byOrder ? orderDetails.get(card.key)?.date : card.delivery?.day) ?? null,
             range: !byOrder && card.delivery?.range === true,
             minutes: byOrder ? null : card.delivery?.minutes ?? null,
         })).filter(card => card.rect.height > 0 && card.rect.width > 0);
@@ -416,13 +475,23 @@
         const tabs = onOrdersPage && document.querySelector('[data-widget="tabsSelector"]');
         if (!firstList && !tabs) {
             panel.remove();
+            displayedTab = null;
             pendingOrders = [];
             stopPreloading();
-            applyFilter([]);
+            applyVisibility([], []);
             watchCardSizes([]);
             return;
         }
 
+        const tab = currentTab();
+        const isActive = tab === 'active';
+        if (displayedTab !== tab) {
+            displayedTab = tab;
+            searchInput.value = searches[tab];
+            activeControls.hidden = !isActive;
+            panelTitle.textContent = isActive ? 'Сортировка и поиск' : 'Поиск по завершённым';
+            stopPreloading();
+        }
         const paginator = firstList?.closest('[data-widget="paginator"]');
         const lists = paginator ? [...paginator.querySelectorAll(listSelector)] : (firstList ? [firstList] : []);
         // Inserting siblings into Ozon's root while Vue hydrates can abort the whole order list.
@@ -433,40 +502,72 @@
 
         const today = new Date();
         const cards = lists.flatMap(list => Array.from(list.children, element => readCard(element, today))).filter(Boolean);
-        const preloading = preloadActiveOrders(paginator, firstList, cards.length);
-        const visibleCards = preloading ? cards : applyFilter(cards);
-        const sort = sortControl.value;
+        const query = searches[tab];
+        const words = normalizeSearch(query).split(' ').filter(Boolean);
+        const searching = words.length > 0;
+        const orderNumber = /^(?:[№#]\s*)?\d{7,}(?:[\s–—-]+\d+)*$/.test(query) ? query.replace(/\D/g, '') : '';
+        const preloading = preloadOrders(paginator, firstList, cards.length, isActive || searching);
+        const useStatusFilters = isActive && (!preloading || searching);
+        const candidates = cards.filter(card => !useStatusFilters || !(
+            (hideDeliveredControl.checked && card.delivered) || (hideCancelledControl.checked && card.cancelled)
+        ));
+
+        const visibleCards = [];
+        const searchPending = [];
+        const searchFailed = [];
+        for (const card of candidates) {
+            if (!searching || (orderNumber ? card.number.replace(/\D/g, '').includes(orderNumber)
+                : words.every(word => card.searchText.includes(word)))) {
+                visibleCards.push(card);
+            } else if (!orderNumber) {
+                const products = orderDetails.get(card.key)?.products;
+                if (!orderDetails.has(card.key)) searchPending.push(card);
+                else if (!products) searchFailed.push(card);
+                else if (words.every(word => card.searchText.includes(word) || products.includes(word))) visibleCards.push(card);
+            }
+        }
+        applyVisibility(cards, visibleCards);
+
+        const sort = isActive ? sortControl.value : 'default';
         const byOrder = sort.startsWith('order-');
-        const orderURLs = byOrder && !preloading ? [...new Set(visibleCards.map(card => card.url))] : [];
-        pendingOrders = orderURLs.filter(url => !orderDates.has(url));
-        const loadingOrderDates = pendingOrders.length > 0 && !requestsPaused;
-        const waitToSort = preloading || loadingOrderDates;
+        const dateOrders = byOrder && !preloading ? visibleCards : [];
+        const datePending = dateOrders.filter(card => !orderDetails.has(card.key));
+        const dateFailed = dateOrders.filter(card => orderDetails.has(card.key) && orderDetails.get(card.key)?.date == null);
+        pendingOrders = Array.from(new Map([...datePending, ...searchPending].map(card => [card.key, card])).values());
+        retryOrders = [...new Set([...searchFailed, ...dateFailed].map(card => card.key))];
+        const loadingOrderDates = datePending.length > 0 && !requestsPaused;
+        const loadingSearch = searchPending.length > 0 && !requestsPaused;
+        const waitToSort = preloading || loadingOrderDates || loadingSearch;
         watchCardSizes(waitToSort || sort === 'default' ? [] : visibleCards);
         const canSort = waitToSort || sort === 'default' || positionCards(visibleCards, sort, byOrder);
 
         const status = [];
         const hidden = cards.length - visibleCards.length;
-        if (!cards.length) status.push('На странице пока нет доступных карточек заказов.');
-        if (hidden) status.push(visibleCards.length ? `Скрыто заказов: ${hidden}.` : 'Все загруженные заказы скрыты фильтрами.');
+        if (searching) status.push(`Найдено заказов: ${visibleCards.length}.`);
+        else if (!cards.length) status.push('На странице пока нет доступных карточек заказов.');
+        else if (hidden) status.push(visibleCards.length ? `Скрыто заказов: ${hidden}.` : 'Все загруженные заказы скрыты фильтрами.');
         if (!canSort) status.push('Сортировка недоступна для этого вида ленты.');
-        if (preloading) status.push(`Подгружаются актуальные заказы… Загружено ${cards.length}.`);
-        else if (preload) status.push('Ozon пока не загрузил следующую порцию актуальных заказов.');
+        if (preloading) status.push(`Подгружаются заказы… Загружено ${cards.length}.`);
+        else if (preload) status.push('Ozon пока не загрузил следующую страницу заказов.');
         if (!preloading && canSort && visibleCards.length && sort.startsWith('delivery-')) {
             status.push('Для действующего интервала берётся ближайший день.');
         }
-        const missingDates = byOrder && (visibleCards.some(card => orderDates.get(card.url) === null)
-            || (requestsPaused && pendingOrders.length > 0));
-        if (loadingOrderDates) status.push(`Загружаются даты оформления… ${orderURLs.length - pendingOrders.length} из ${orderURLs.length}.`);
+        const missingDates = dateFailed.length > 0 || (requestsPaused && datePending.length > 0);
+        const missingSearch = searchFailed.length + (requestsPaused ? searchPending.length : 0);
+        if (loadingSearch) status.push(`Проверено заказов: ${candidates.length - searchPending.length} из ${candidates.length}.`);
+        if (missingSearch) status.push(`Не удалось проверить названия в ${missingSearch} заказах.`);
+        if (loadingOrderDates) status.push(`Загружаются даты оформления… ${dateOrders.length - datePending.length} из ${dateOrders.length}.`);
         if (missingDates) {
             status.push('Часть дат оформления недоступна. Эти заказы в конце списка.');
         }
+        clearSearch.hidden = !searchInput.value && !query;
         resetControl.hidden = sort === 'default' && !hideDeliveredControl.checked && !hideCancelledControl.checked;
-        retryControl.hidden = !missingDates;
-        statusLine.hidden = status.length === 0;
+        retryControl.hidden = !missingDates && !missingSearch && (!searching || !preload || preloading);
+        feedback.hidden = status.length === 0;
         const message = status.join(' ');
         if (statusLine.textContent !== message) statusLine.textContent = message;
 
-        void loadOrderDates();
+        void loadOrderDetails();
     }
 
     function scheduleRender() {
